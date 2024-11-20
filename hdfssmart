@@ -1,0 +1,224 @@
+#!/bin/bash
+
+# Script to list and download files from HDFS through Knox Gateway with download history
+# Usage: ./knox_hdfs_smart_download.sh <hdfs_path> <app_name> <knox_user> <knox_password>
+
+# Exit on any error
+set -e
+
+# Configuration
+KNOX_HOST="web:9443"
+KNOX_BASE_PATH="/gateway/cdp-proxy-api/webhdfs/v1"
+OUTPUT_DIR="/opt/splunk/data"
+TEMP_DIR="/tmp/hdfs_listing"
+HISTORY_DIR="/var/log/hdfs_downloads"
+RETENTION_DAYS=30  # How many days to keep download history
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+# Validate input parameters
+if [ "$#" -ne 4 ]; then
+    echo "Usage: $0 <hdfs_path> <app_name> <knox_user> <knox_password>"
+    echo "Example: $0 /prd/logs/myapp myapp knox_user password"
+    exit 1
+fi
+
+# Input parameters
+HDFS_PATH="$1"
+APP_NAME="$2"
+KNOX_USER="$3"
+KNOX_PASSWORD="$4"
+
+# Setup paths and create necessary directories
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}"
+mkdir -p "$LOCAL_DIR"
+mkdir -p "$TEMP_DIR"
+mkdir -p "$HISTORY_DIR"
+
+# Setup logging
+LOG_FILE="${HISTORY_DIR}/${APP_NAME}_download.log"
+HISTORY_FILE="${HISTORY_DIR}/${APP_NAME}_history.db"
+TEMP_HISTORY="${TEMP_DIR}/temp_history_${TIMESTAMP}"
+
+# Function to handle errors
+handle_error() {
+    log_message "ERROR: $1"
+    exit 1
+}
+
+# Function to get file metadata from HDFS
+get_file_metadata() {
+    local file_path="$1"
+    local metadata_url="https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS"
+    
+    curl -s -k -u "${KNOX_USER}:${KNOX_PASSWORD}" "$metadata_url" | \
+        jq -r '.FileStatus | "\(.length)|\(.modificationTime)|\(.permission)|\(.owner)"'
+}
+
+# Function to create file signature
+create_file_signature() {
+    local file_path="$1"
+    local metadata="$2"
+    echo "${file_path}|${metadata}" | md5sum | cut -d' ' -f1
+}
+
+# Function to check if file was already downloaded
+is_file_downloaded() {
+    local file_path="$1"
+    local metadata="$2"
+    local signature=$(create_file_signature "$file_path" "$metadata")
+    
+    if [ -f "$HISTORY_FILE" ]; then
+        if grep -q "$signature" "$HISTORY_FILE"; then
+            local download_date=$(grep "$signature" "$HISTORY_FILE" | cut -d'|' -f3)
+            log_message "File already downloaded on $download_date: $file_path"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Function to record downloaded file
+record_download() {
+    local file_path="$1"
+    local metadata="$2"
+    local local_path="$3"
+    local signature=$(create_file_signature "$file_path" "$metadata")
+    local download_date=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo "${signature}|${file_path}|${download_date}|${local_path}|${metadata}" >> "$HISTORY_FILE"
+}
+
+# Function to clean old history
+cleanup_history() {
+    if [ -f "$HISTORY_FILE" ]; then
+        local cutoff_date=$(date -d "$RETENTION_DAYS days ago" '+%Y-%m-%d')
+        
+        # Create temporary file with recent entries
+        awk -F'|' -v cutoff="$cutoff_date" '
+            function to_date(datetime) {
+                return substr(datetime, 1, 10)
+            }
+            to_date($3) >= cutoff' "$HISTORY_FILE" > "$TEMP_HISTORY"
+        
+        # Replace old history with cleaned up version
+        mv "$TEMP_HISTORY" "$HISTORY_FILE"
+        
+        log_message "Cleaned up download history older than $cutoff_date"
+    fi
+}
+
+# Function to list files in HDFS directory
+list_hdfs_files() {
+    local path="$1"
+    local listing_file="${TEMP_DIR}/listing_${TIMESTAMP}.json"
+    
+    log_message "Listing contents of HDFS path: ${path}"
+    
+    # Get directory listing
+    curl -s -k -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${path}?op=LISTSTATUS" > "$listing_file"
+    
+    if [ $? -ne 0 ] || [ ! -s "$listing_file" ]; then
+        handle_error "Failed to get directory listing"
+    fi
+    
+    echo "$listing_file"
+}
+
+# Function to download a single file
+download_file() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local local_file="${LOCAL_DIR}/${filename}_${TIMESTAMP}"
+    
+    # Get file metadata
+    local metadata=$(get_file_metadata "$file_path")
+    
+    # Check if file was already downloaded
+    if is_file_downloaded "$file_path" "$metadata"; then
+        return 0
+    fi
+    
+    log_message "Downloading: ${file_path}"
+    
+    # Download the file
+    curl -s -k -L -o "$local_file" \
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
+    
+    if [ $? -ne 0 ] || [ ! -s "$local_file" ]; then
+        handle_error "Failed to download file: ${file_path}"
+    fi
+    
+    chmod 644 "$local_file"
+    
+    # Record successful download
+    record_download "$file_path" "$metadata" "$local_file"
+    
+    log_message "Successfully downloaded to: $local_file"
+    echo "$local_file"
+}
+
+# Function to display download history
+show_download_history() {
+    local days=${1:-7}  # Default to last 7 days
+    local cutoff_date=$(date -d "$days days ago" '+%Y-%m-%d')
+    
+    log_message "Showing download history for the last $days days:"
+    if [ -f "$HISTORY_FILE" ]; then
+        awk -F'|' -v cutoff="$cutoff_date" '
+            function to_date(datetime) {
+                return substr(datetime, 1, 10)
+            }
+            to_date($3) >= cutoff {
+                printf "File: %s\nDownloaded: %s\nLocal path: %s\n\n", $2, $3, $4
+            }' "$HISTORY_FILE"
+    fi
+}
+
+# Main execution
+main() {
+    log_message "Starting HDFS smart download process"
+    log_message "Parameters: HDFS Path: $HDFS_PATH, App Name: $APP_NAME"
+    
+    # Clean up old history entries
+    cleanup_history
+    
+    # Get directory listing
+    listing_file=$(list_hdfs_files "$HDFS_PATH")
+    
+    # Process each file in the directory
+    local file_count=0
+    local download_count=0
+    local skip_count=0
+    
+    while IFS= read -r filepath; do
+        ((file_count++))
+        if download_file "$filepath"; then
+            ((download_count++))
+        else
+            ((skip_count++))
+        fi
+    done < <(jq -r '.FileStatuses.FileStatus[] | select(.type=="FILE") | .pathSuffix' "$listing_file" | \
+             while read -r filename; do echo "${HDFS_PATH%/}/$filename"; done)
+    
+    log_message "Process completed."
+    log_message "Found: $file_count files"
+    log_message "Downloaded: $download_count files"
+    log_message "Skipped: $skip_count files (already downloaded)"
+    
+    # Show recent download history
+    show_download_history 1  # Show last 24 hours
+    
+    # Cleanup
+    rm -f "$listing_file"
+}
+
+# Execute main function
+main
