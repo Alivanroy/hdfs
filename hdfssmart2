@@ -1,0 +1,158 @@
+#!/bin/bash
+
+# Script to download files from HDFS through Knox Gateway with date-based paths
+# Usage: ./knox_hdfs_download.sh <base_path> <app_name> <knox_user> <knox_password> [date]
+
+# Exit on any error
+set -e
+
+# Configuration
+KNOX_HOST="web:9443"
+KNOX_BASE_PATH="/gateway/cdp-proxy-api/webhdfs/v1"
+OUTPUT_DIR="/opt/splunk/data"
+HISTORY_DIR="/var/log/hdfs_downloads"
+
+# Function to log messages
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
+}
+
+# Function to validate date format
+validate_date() {
+    local date_str="$1"
+    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
+        echo "Invalid date format. Expected YYYYMMDD, got: $date_str"
+        return 1
+    }
+    
+    local year="${date_str:0:4}"
+    local month="${date_str:4:2}"
+    local day="${date_str:6:2}"
+    
+    if [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
+        echo "Invalid month: $month"
+        return 1
+    fi
+    if [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
+        echo "Invalid day: $day"
+        return 1
+    fi
+    return 0
+}
+
+# Validate input parameters
+if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+    echo "Usage: $0 <base_path> <app_name> <knox_user> <knox_password> [date]"
+    echo "Example: $0 /prd/myapp myapp knox_user password [20240120]"
+    echo "If date is not provided, current date will be used"
+    exit 1
+fi
+
+# Input parameters
+BASE_PATH="$1"
+APP_NAME="$2"
+KNOX_USER="$3"
+KNOX_PASSWORD="$4"
+
+# Handle date parameter
+if [ -z "$5" ]; then
+    # Use current date if not provided
+    DATE_PATH=$(date '+%Y%m%d')
+else
+    DATE_PATH="$5"
+    # Validate date format
+    if ! validate_date "$DATE_PATH"; then
+        log_message "Error: $?"
+        exit 1
+    fi
+fi
+
+# Construct full HDFS path
+HDFS_PATH="${BASE_PATH}/${DATE_PATH}"
+
+# Setup local paths
+TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}/${DATE_PATH}"
+mkdir -p "$LOCAL_DIR"
+mkdir -p "$HISTORY_DIR"
+
+# Function to handle errors
+handle_error() {
+    log_message "ERROR: $1"
+    exit 1
+}
+
+# Function to list files in HDFS directory
+list_hdfs_files() {
+    local path="$1"
+    log_message "Listing contents of HDFS path: ${path}"
+    
+    # Get directory listing
+    local response=$(curl -s -k -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${path}?op=LISTSTATUS")
+    
+    if [ $? -ne 0 ]; then
+        handle_error "Failed to get directory listing"
+    fi
+    
+    # Check if response contains FileStatuses
+    if ! echo "$response" | grep -q "FileStatuses"; then
+        handle_error "Invalid response or empty directory"
+    fi
+    
+    echo "$response"
+}
+
+# Function to download a single file
+download_file() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local local_file="${LOCAL_DIR}/${filename}"
+    
+    log_message "Downloading: ${file_path}"
+    
+    # Download the file
+    curl -s -k -L -o "$local_file" \
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
+    
+    if [ $? -ne 0 ] || [ ! -s "$local_file" ]; then
+        handle_error "Failed to download file: ${file_path}"
+    fi
+    
+    chmod 644 "$local_file"
+    log_message "Successfully downloaded to: $local_file"
+    echo "$local_file"
+}
+
+# Main execution
+main() {
+    log_message "Starting HDFS download process"
+    log_message "Parameters: Base Path: $BASE_PATH, App Name: $APP_NAME, Date: $DATE_PATH"
+    
+    # Get directory listing
+    local listing=$(list_hdfs_files "$HDFS_PATH")
+    
+    # Process each file in the directory
+    local file_count=0
+    local download_count=0
+    
+    while IFS= read -r filepath; do
+        if [ ! -z "$filepath" ]; then
+            ((file_count++))
+            if download_file "${HDFS_PATH}/${filepath}"; then
+                ((download_count++))
+            fi
+        fi
+    done < <(echo "$listing" | grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
+    
+    log_message "Process completed."
+    log_message "Found: $file_count files"
+    log_message "Downloaded: $download_count files"
+    
+    # Return the date-specific directory for BMC Control-M
+    echo "$LOCAL_DIR"
+}
+
+# Execute main function
+main
