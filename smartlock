@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Script to download files from HDFS through Knox Gateway with concurrent execution support
-# Usage: ./knox_hdfs_download.sh <base_path> <app_name> <knox_user> <knox_password> [date]
+# Usage: ./knox_hdfs_download.sh <base_path> <app_name> [date]
 
 # Exit on any error
 set -e
@@ -13,12 +13,26 @@ OUTPUT_DIR="/opt/splunk/data"
 LOG_DIR="/var/log/hdfs_downloads"
 LOG_RETENTION_DAYS=7
 
+# Credentials
+KNOX_USER="your_username_here"
+KNOX_PASSWORD="your_password_here"
+
 # Generate unique process ID
 PROCESS_ID="$$_$(date +%s%N)"
 
 # Lock file directory
 LOCK_DIR="/var/lock/hdfs_downloads"
 mkdir -p "$LOCK_DIR"
+
+# Function to validate date format
+validate_date() {
+    local date_str="$1"
+    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
+        log_message "ERROR" "Invalid date format. Expected YYYYMMDD" "\"date\":\"${date_str}\""
+        return 1
+    fi
+    return 0
+}
 
 # Function to acquire lock
 acquire_lock() {
@@ -102,6 +116,15 @@ write_to_consolidated_log() {
     fi
 }
 
+# Function to get file size from HDFS
+get_file_size() {
+    local file_path="$1"
+    local size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" | \
+        grep -i "Content-Length" | awk '{print $2}' | tr -d '\r')
+    echo "${size:-0}"
+}
+
 # Function to format file size
 format_size() {
     local size=$1
@@ -115,36 +138,6 @@ format_size() {
         echo "${size}B"
     fi
 }
-
-# [Previous validation and parameter handling code remains the same]
-
-# Input parameters
-BASE_PATH="$1"
-APP_NAME="$2"
-KNOX_USER="$3"
-KNOX_PASSWORD="$4"
-
-# Handle date parameter
-if [ -z "$5" ]; then
-    DATE_PATH=$(date '+%Y%m%d')
-else
-    DATE_PATH="$5"
-    if ! validate_date "$DATE_PATH"; then
-        exit 1
-    fi
-fi
-
-# Setup logging with process isolation
-setup_logging "$APP_NAME" "$DATE_PATH"
-
-# Construct full HDFS path
-HDFS_PATH="${BASE_PATH}/${DATE_PATH}"
-
-# Setup local paths with process isolation
-LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}/${DATE_PATH}"
-TEMP_DIR="${OUTPUT_DIR}/${APP_NAME}/temp/${PROCESS_ID}"
-mkdir -p "$LOCAL_DIR"
-mkdir -p "$TEMP_DIR"
 
 # Function to safely move files to final location
 move_to_final_location() {
@@ -222,13 +215,65 @@ trap cleanup EXIT
 
 # Main execution
 main() {
-    log_message "INFO" "Starting HDFS download process" 
+    log_message "INFO" "Starting HDFS download process"
     
-    # [Rest of the main function remains the same]
+    # List files in HDFS directory
+    local files_list=$(curl -s -k -L \
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${HDFS_PATH}?op=LISTSTATUS" | \
+        grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
     
-    # Consolidate logs before exit
-    cleanup
+    if [ -z "$files_list" ]; then
+        log_message "ERROR" "No files found or error listing directory" "\"path\":\"${HDFS_PATH}\""
+        exit 1
+    fi
+    
+    # Download each file
+    local success_count=0
+    local total_files=0
+    
+    while IFS= read -r file; do
+        if [ ! -z "$file" ]; then
+            total_files=$((total_files + 1))
+            if download_file "${HDFS_PATH}/${file}"; then
+                success_count=$((success_count + 1))
+            fi
+        fi
+    done <<< "$files_list"
+    
+    log_message "INFO" "Download process completed" "\"total_files\":${total_files},\"successful_downloads\":${success_count}"
+    
+    if [ $success_count -ne $total_files ]; then
+        log_message "ERROR" "Some downloads failed" "\"failed_downloads\":$((total_files - success_count))"
+        exit 1
+    fi
 }
+
+# Input parameters
+BASE_PATH="$1"
+APP_NAME="$2"
+
+# Handle date parameter
+if [ -z "$3" ]; then
+    DATE_PATH=$(date '+%Y%m%d')
+else
+    DATE_PATH="$3"
+    if ! validate_date "$DATE_PATH"; then
+        exit 1
+    fi
+fi
+
+# Setup logging with process isolation
+setup_logging "$APP_NAME" "$DATE_PATH"
+
+# Construct full HDFS path
+HDFS_PATH="${BASE_PATH}/${DATE_PATH}"
+
+# Setup local paths with process isolation
+LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}/${DATE_PATH}"
+TEMP_DIR="${OUTPUT_DIR}/${APP_NAME}/temp/${PROCESS_ID}"
+mkdir -p "$LOCAL_DIR"
+mkdir -p "$TEMP_DIR"
 
 # Execute main function
 main
