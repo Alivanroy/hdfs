@@ -1,0 +1,330 @@
+#!/bin/bash
+
+# Script to download files from HDFS through Knox Gateway
+# Usage: ./knox_hdfs_download.sh -p "path1 path2..." -a app_name [-d date]
+
+set -e
+
+# Configuration
+KNOX_HOST="web:9443"
+KNOX_BASE_PATH="/gateway/cdp-proxy-api/webhdfs/v1"
+OUTPUT_DIR="/opt/splunk/data"
+LOG_DIR="/var/log/hdfs_downloads"
+LOG_RETENTION_DAYS=7
+DATA_RETENTION_DAYS=30
+
+SPLUNK_USER="splunk"
+SPLUNK_GROUP="splunk"
+
+KNOX_USER="your_username_here"
+KNOX_PASSWORD="your_password_here"
+
+PROCESS_ID="$$_$(date +%s%N)"
+LOCK_DIR="/var/lock/hdfs_downloads"
+mkdir -p "$LOCK_DIR"
+chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOCK_DIR"
+
+# Parse command line arguments
+while getopts "p:a:d:" opt; do
+    case $opt in
+        p) BASE_PATHS=($OPTARG);;
+        a) APP_NAME=$OPTARG;;
+        d) DATE_PATH=$OPTARG;;
+        ?) echo "Usage: $0 -p \"path1 path2...\" -a app_name [-d date]" >&2; exit 1;;
+    esac
+done
+
+# Validate required parameters
+if [ -z "$BASE_PATHS" ] || [ -z "$APP_NAME" ]; then
+    echo "Error: Base paths and app name are required"
+    echo "Usage: $0 -p \"path1 path2...\" -a app_name [-d date]"
+    exit 1
+fi
+
+# Function to validate date format
+validate_date() {
+    local date_str="$1"
+    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
+        log_message "ERROR" "Invalid date format. Expected YYYYMMDD" "\"date\":\"${date_str}\""
+        return 1
+    fi
+    return 0
+}
+
+# Function to acquire lock
+acquire_lock() {
+    local lock_file="$1"
+    local wait_time=0
+    local max_wait=300  # 5 minutes maximum wait time
+    
+    while ! mkdir "$lock_file" 2>/dev/null; do
+        wait_time=$((wait_time + 1))
+        if [ $wait_time -ge $max_wait ]; then
+            echo "ERROR: Could not acquire lock after 5 minutes"
+            return 1
+        fi
+        sleep 1
+    done
+    chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$lock_file"
+    return 0
+}
+
+# Function to release lock
+release_lock() {
+    local lock_file="$1"
+    rm -rf "$lock_file"
+}
+
+# Function to rotate old data
+rotate_old_data() {
+    local app="$1"
+    local base_dir="${OUTPUT_DIR}/${app}"
+    local rotation_lock="${LOCK_DIR}/data_rotation.lock"
+    
+    if acquire_lock "$rotation_lock"; then
+        log_message "INFO" "Starting data rotation" "\"retention_days\":${DATA_RETENTION_DAYS}"
+        
+        # Find and delete old data directories
+        find "$base_dir" -maxdepth 1 -type d -mtime +${DATA_RETENTION_DAYS} | while read dir; do
+            if [[ "$dir" != "$base_dir" && "$dir" != "${base_dir}/temp" ]]; then
+                local dir_date=$(basename "$dir")
+                if [[ "$dir_date" =~ ^[0-9]{8}$ ]]; then
+                    log_message "INFO" "Removing old data directory" "\"directory\":\"$dir\""
+                    rm -rf "$dir"
+                fi
+            fi
+        done
+        
+        release_lock "$rotation_lock"
+    else
+        log_message "WARN" "Could not acquire lock for data rotation" "\"lock_file\":\"$rotation_lock\""
+    fi
+}
+
+# Setup logging with process isolation
+setup_logging() {
+    local app="$1"
+    local date_path="$2"
+    
+    mkdir -p "$LOG_DIR"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_DIR"
+    
+    LOG_FILE="${LOG_DIR}/${app}_${date_path}_${PROCESS_ID}.log"
+    
+    touch "$LOG_FILE"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_FILE"
+    
+    # Rotate old logs
+    local rotation_lock="${LOCK_DIR}/rotation.lock"
+    if acquire_lock "$rotation_lock"; then
+        find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +${LOG_RETENTION_DAYS} -delete
+        release_lock "$rotation_lock"
+    fi
+}
+
+# Function to log messages with JSON format
+log_message() {
+    local level="$1"
+    local message="$2"
+    local additional_fields="$3"
+    
+    local timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    
+    local log_entry="{\"timestamp\":\"${timestamp}\",\"level\":\"${level}\",\"app\":\"${APP_NAME}\",\"process_id\":\"${PROCESS_ID}\",\"message\":\"${message}\""
+    
+    if [ ! -z "$additional_fields" ]; then
+        log_entry="${log_entry},${additional_fields}"
+    fi
+    
+    log_entry="${log_entry}}"
+    
+    # Use flock for atomic writes
+    (
+        flock -x 200
+        echo "$log_entry" >> "$LOG_FILE"
+    ) 200>"$LOG_FILE.lock"
+    
+    echo "$log_entry"
+}
+
+# Function to write to consolidated log
+write_to_consolidated_log() {
+    local app="$1"
+    local date_path="$2"
+    local consolidated_log="${LOG_DIR}/${app}_${date_path}.log"
+    local lock_file="${LOCK_DIR}/${app}_${date_path}.lock"
+    
+    if acquire_lock "$lock_file"; then
+        cat "$LOG_FILE" >> "$consolidated_log"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$consolidated_log"
+        release_lock "$lock_file"
+    fi
+}
+
+# Function to get file size from HDFS
+get_file_size() {
+    local file_path="$1"
+    local size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" | \
+        grep -i "Content-Length" | awk '{print $2}' | tr -d '\r')
+    echo "${size:-0}"
+}
+
+# Function to format file size
+format_size() {
+    local size=$1
+    if [ $size -ge 1073741824 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1073741824}")GB"
+    elif [ $size -ge 1048576 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1048576}")MB"
+    elif [ $size -ge 1024 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1024}")KB"
+    else
+        echo "${size}B"
+    fi
+}
+
+# Function to safely move files to final location
+move_to_final_location() {
+    local temp_file="$1"
+    local final_file="$2"
+    local lock_file="${LOCK_DIR}/$(basename "$final_file").lock"
+    
+    if acquire_lock "$lock_file"; then
+        mv "$temp_file" "$final_file"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$final_file"
+        chmod 644 "$final_file"
+        release_lock "$lock_file"
+        return 0
+    fi
+    return 1
+}
+
+# Modified download_file function to handle paths without dates
+download_file() {
+    local base_path="$1"
+    local file_path="$2"
+    local filename=$(basename "$file_path")
+    local relative_path=$(dirname "${file_path#$base_path}")
+    local temp_file="${TEMP_DIR}/${filename}"
+    local final_file="${LOCAL_DIR}${relative_path}/${filename}"
+    
+    # Create directory structure
+    mkdir -p "$(dirname "$final_file")"
+    
+    if [ -f "$final_file" ]; then
+        log_message "INFO" "File already exists" "\"file\":\"${filename}\",\"status\":\"skipped\""
+        return 0
+    fi
+    
+    local file_size=$(get_file_size "$file_path")
+    local formatted_size=$(format_size "$file_size")
+    
+    log_message "INFO" "Starting download" "\"file\":\"${filename}\",\"size\":\"${formatted_size}\""
+    
+    local start_time=$(date +%s)
+    
+    # Download to temporary location
+    curl -s -k -L -o "$temp_file" \
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    if [ $? -ne 0 ] || [ ! -s "$temp_file" ]; then
+        log_message "ERROR" "Download failed" "\"file\":\"${filename}\",\"size\":\"${formatted_size}\""
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$temp_file"
+    chmod 644 "$temp_file"
+    
+    # Move to final location
+    if move_to_final_location "$temp_file" "$final_file"; then
+        log_message "INFO" "Download completed" "\"file\":\"${filename}\",\"size\":\"${formatted_size}\",\"duration_seconds\":${duration},\"status\":\"success\""
+        return 0
+    else
+        log_message "ERROR" "Failed to move file to final location" "\"file\":\"${filename}\""
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    rm -rf "$TEMP_DIR"
+    write_to_consolidated_log "$APP_NAME" "${DATE_PATH:-nodate}"
+    rm -f "$LOG_FILE" "$LOG_FILE.lock"
+}
+
+# Register cleanup on script exit
+trap cleanup EXIT
+
+# Main execution function
+main() {
+    log_message "INFO" "Starting HDFS download process"
+    
+    rotate_old_data "$APP_NAME"
+    
+    local total_success=0
+    local total_files=0
+    
+    for base_path in "${BASE_PATHS[@]}"; do
+        local hdfs_path="$base_path"
+        # Append date to path if provided
+        if [ ! -z "$DATE_PATH" ]; then
+            hdfs_path="${base_path}/${DATE_PATH}"
+        fi
+        
+        log_message "INFO" "Processing path" "\"path\":\"${hdfs_path}\""
+        
+        local files_list=$(curl -s -k -L \
+            -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+            "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" | \
+            grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ -z "$files_list" ]; then
+            log_message "WARN" "No files found in directory" "\"path\":\"${hdfs_path}\""
+            continue
+        fi
+        
+        while IFS= read -r file; do
+            if [ ! -z "$file" ]; then
+                total_files=$((total_files + 1))
+                if download_file "$base_path" "${hdfs_path}/${file}"; then
+                    total_success=$((total_success + 1))
+                fi
+            fi
+        done <<< "$files_list"
+    done
+    
+    log_message "INFO" "Download process completed" "\"total_files\":${total_files},\"successful_downloads\":${total_success}"
+    
+    if [ $total_success -ne $total_files ]; then
+        log_message "ERROR" "Some downloads failed" "\"failed_downloads\":$((total_files - total_success))"
+        exit 1
+    fi
+}
+
+# Setup initial paths and logging
+LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}"
+if [ ! -z "$DATE_PATH" ]; then
+    if ! validate_date "$DATE_PATH"; then
+        exit 1
+    fi
+    LOCAL_DIR="${LOCAL_DIR}/${DATE_PATH}"
+fi
+
+TEMP_DIR="${OUTPUT_DIR}/${APP_NAME}/temp/${PROCESS_ID}"
+mkdir -p "$LOCAL_DIR"
+mkdir -p "$TEMP_DIR"
+
+chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOCAL_DIR"
+chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$TEMP_DIR"
+
+setup_logging "$APP_NAME" "${DATE_PATH:-nodate}"
+trap cleanup EXIT
+
+main
