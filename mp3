@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # Script to download files from HDFS through Knox Gateway with concurrent execution support
-# Usage: ./knox_hdfs_download.sh <app_name> <base_path1,base_path2,...> [date]
+# Usage: ./knox_hdfs_download.sh <app_name> <path_config>
+# Path config format: path1:date|nodate,path2:date|nodate
+# Example: /hdfs/path1:date,/hdfs/path2:nodate
 
 set -e
 
@@ -24,6 +26,72 @@ LOCK_DIR="/var/lock/hdfs_downloads"
 mkdir -p "$LOCK_DIR"
 chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOCK_DIR"
 
+# Function to acquire lock
+acquire_lock() {
+    local lock_file="$1"
+    local wait_time=0
+    local max_wait=300  # 5 minutes maximum wait time
+    
+    while ! mkdir "$lock_file" 2>/dev/null; do
+        wait_time=$((wait_time + 1))
+        if [ $wait_time -ge $max_wait ]; then
+            echo "ERROR: Could not acquire lock after 5 minutes"
+            return 1
+        fi
+        sleep 1
+    done
+    chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$lock_file"
+    return 0
+}
+
+# Function to release lock
+release_lock() {
+    local lock_file="$1"
+    rm -rf "$lock_file"
+}
+
+# Function to rotate old data
+rotate_old_data() {
+    local app="$1"
+    local base_dir="${OUTPUT_DIR}/${app}"
+    local rotation_lock="${LOCK_DIR}/data_rotation.lock"
+    
+    if acquire_lock "$rotation_lock"; then
+        log_message "INFO" "Starting data rotation" "\"retention_days\":${DATA_RETENTION_DAYS}"
+        
+        # Find and delete old data directories
+        find "$base_dir" -maxdepth 1 -type d -mtime +${DATA_RETENTION_DAYS} | while read dir; do
+            if [[ "$dir" != "$base_dir" && "$dir" != "${base_dir}/temp" ]]; then
+                local dir_date=$(basename "$dir")
+                if [[ "$dir_date" =~ ^[0-9]{8}$ ]]; then
+                    log_message "INFO" "Removing old data directory" "\"directory\":\"$dir\""
+                    rm -rf "$dir"
+                fi
+            fi
+        done
+        
+        release_lock "$rotation_lock"
+    else
+        log_message "WARN" "Could not acquire lock for data rotation" "\"lock_file\":\"$rotation_lock\""
+    fi
+}
+
+# Function to safely move files to final location
+move_to_final_location() {
+    local temp_file="$1"
+    local final_file="$2"
+    local lock_file="${LOCK_DIR}/$(basename "$final_file").lock"
+    
+    if acquire_lock "$lock_file"; then
+        mv "$temp_file" "$final_file"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$final_file"
+        chmod 644 "$final_file"
+        release_lock "$lock_file"
+        return 0
+    fi
+    return 1
+}
+
 # Function to validate date format
 validate_date() {
     local date_str="$1"
@@ -34,18 +102,28 @@ validate_date() {
     return 0
 }
 
+# Function to get today's date in YYYYMMDD format
+get_today_date() {
+    date '+%Y%m%d'
+}
+
 # Modified download_file function to handle different path structures
 download_file() {
     local file_path="$1"
     local base_path="$2"
+    local use_date="$3"
     local filename=$(basename "$file_path")
     
-    local final_dir
-    if [ -z "$DATE_PATH" ]; then
-        final_dir="${LOCAL_BASE_DIR}/$(basename "$base_path")_files"
-    else
-        final_dir="${LOCAL_BASE_DIR}/${DATE_PATH}/$(basename "$base_path")_files"
+    # Create output directory structure
+    local final_dir="${LOCAL_BASE_DIR}"
+    if [ "$use_date" = "date" ]; then
+        local date_str="${TODAY_DATE}"
+        if [[ "$file_path" =~ /([0-9]{8})/ ]]; then
+            date_str="${BASH_REMATCH[1]}"
+        fi
+        final_dir="${final_dir}/${date_str}"
     fi
+    final_dir="${final_dir}/$(basename "$base_path")_files"
     
     mkdir -p "$final_dir"
     chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$final_dir"
@@ -92,42 +170,66 @@ download_file() {
     fi
 }
 
-# Modified main function to handle multiple paths
+# Function to process a single path
+process_path() {
+    local base_path="$1"
+    local use_date="$2"
+    local path_success=0
+    local path_total=0
+    
+    local hdfs_path="$base_path"
+    if [ "$use_date" = "date" ]; then
+        hdfs_path="${base_path}/${TODAY_DATE}"
+    fi
+    
+    log_message "INFO" "Processing path" "\"path\":\"${hdfs_path}\",\"date_mode\":\"${use_date}\""
+    
+    local files_list=$(curl -s -k -L \
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" | \
+        grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
+    
+    if [ -z "$files_list" ]; then
+        log_message "ERROR" "No files found" "\"path\":\"${hdfs_path}\""
+        return 0
+    fi
+    
+    while IFS= read -r file; do
+        if [ ! -z "$file" ]; then
+            path_total=$((path_total + 1))
+            if download_file "${hdfs_path}/${file}" "${base_path}" "${use_date}"; then
+                path_success=$((path_success + 1))
+            fi
+        fi
+    done <<< "$files_list"
+    
+    echo "${path_success}:${path_total}"
+}
+
+# Modified main function to handle multiple paths with date configurations
 main() {
-    log_message "INFO" "Starting HDFS download process" "\"paths\":\"${BASE_PATHS}\""
+    log_message "INFO" "Starting HDFS download process" "\"path_config\":\"${PATH_CONFIG}\""
     
     local total_success=0
     local total_files=0
     
-    IFS=',' read -ra PATHS <<< "$BASE_PATHS"
-    for base_path in "${PATHS[@]}"; do
-        local hdfs_path
-        if [ -z "$DATE_PATH" ]; then
-            hdfs_path="${base_path}"
-        else
-            hdfs_path="${base_path}/${DATE_PATH}"
-        fi
+    IFS=',' read -ra PATH_CONFIGS <<< "$PATH_CONFIG"
+    for config in "${PATH_CONFIGS[@]}"; do
+        IFS=':' read -r path date_config <<< "$config"
         
-        log_message "INFO" "Processing path" "\"path\":\"${hdfs_path}\""
+        # Default to nodate if not specified
+        date_config=${date_config:-nodate}
         
-        local files_list=$(curl -s -k -L \
-            -u "${KNOX_USER}:${KNOX_PASSWORD}" \
-            "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" | \
-            grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
-        
-        if [ -z "$files_list" ]; then
-            log_message "ERROR" "No files found" "\"path\":\"${hdfs_path}\""
+        if [ "$date_config" != "date" ] && [ "$date_config" != "nodate" ]; then
+            log_message "ERROR" "Invalid date configuration" "\"path\":\"${path}\",\"config\":\"${date_config}\""
             continue
         fi
         
-        while IFS= read -r file; do
-            if [ ! -z "$file" ]; then
-                total_files=$((total_files + 1))
-                if download_file "${hdfs_path}/${file}" "${base_path}"; then
-                    total_success=$((total_success + 1))
-                fi
-            fi
-        done <<< "$files_list"
+        local result=$(process_path "$path" "$date_config")
+        IFS=':' read -r path_success path_total <<< "$result"
+        
+        total_success=$((total_success + path_success))
+        total_files=$((total_files + path_total))
     done
     
     log_message "INFO" "Process completed" "\"total_files\":${total_files},\"successful\":${total_success}"
@@ -138,26 +240,123 @@ main() {
     fi
 }
 
-# Parse input parameters
+# Validate input parameters
 if [ $# -lt 2 ]; then
-    echo "Usage: $0 <app_name> <base_path1,base_path2,...> [date]"
+    echo "Usage: $0 <app_name> <path1:date|nodate,path2:date|nodate,...>"
+    echo "Example: $0 myapp '/hdfs/path1:date,/hdfs/path2:nodate'"
     exit 1
 fi
 
 APP_NAME="$1"
-BASE_PATHS="$2"
-DATE_PATH="${3:-}"
+PATH_CONFIG="$2"
+TODAY_DATE=$(get_today_date)
 
-if [ ! -z "$DATE_PATH" ] && ! validate_date "$DATE_PATH"; then
-    exit 1
-fi
-
-setup_logging "$APP_NAME" "${DATE_PATH:-nodate}"
+setup_logging "$APP_NAME" "multi"
 
 LOCAL_BASE_DIR="${OUTPUT_DIR}/${APP_NAME}"
 TEMP_DIR="${OUTPUT_DIR}/${APP_NAME}/temp/${PROCESS_ID}"
 mkdir -p "$TEMP_DIR"
 chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$TEMP_DIR"
+
+# Keep existing functions (acquire_lock, release_lock, rotate_old_data, setup_logging, 
+# log_message, write_to_consolidated_log, get_file_size, format_size, 
+# move_to_final_location, cleanup)
+# ... [previous implementation remains the same]
+
+# Setup logging with process isolation
+setup_logging() {
+    local app="$1"
+    local date_path="$2"
+    
+    mkdir -p "$LOG_DIR"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_DIR"
+    
+    # Define log file with date and process ID
+    LOG_FILE="${LOG_DIR}/${app}_${date_path}_${PROCESS_ID}.log"
+    
+    touch "$LOG_FILE"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_FILE"
+    
+    # Rotate old logs
+    local rotation_lock="${LOCK_DIR}/rotation.lock"
+    if acquire_lock "$rotation_lock"; then
+        find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +${LOG_RETENTION_DAYS} -delete
+        release_lock "$rotation_lock"
+    fi
+}
+
+# Function to log messages with JSON format and process ID
+log_message() {
+    local level="$1"
+    local message="$2"
+    local additional_fields="$3"
+    
+    local timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    
+    local log_entry="{\"timestamp\":\"${timestamp}\",\"level\":\"${level}\",\"app\":\"${APP_NAME}\",\"process_id\":\"${PROCESS_ID}\",\"message\":\"${message}\""
+    
+    if [ ! -z "$additional_fields" ]; then
+        log_entry="${log_entry},${additional_fields}"
+    fi
+    
+    log_entry="${log_entry}}"
+    
+    # Use flock for atomic writes to log file
+    (
+        flock -x 200
+        echo "$log_entry" >> "$LOG_FILE"
+    ) 200>"$LOG_FILE.lock"
+    
+    # Also output to stdout for Control-M
+    echo "$log_entry"
+}
+
+# Function to safely write to consolidated log
+write_to_consolidated_log() {
+    local app="$1"
+    local date_path="$2"
+    local consolidated_log="${LOG_DIR}/${app}_${date_path}.log"
+    local lock_file="${LOCK_DIR}/${app}_${date_path}.lock"
+    
+    if acquire_lock "$lock_file"; then
+        cat "$LOG_FILE" >> "$consolidated_log"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$consolidated_log"
+        release_lock "$lock_file"
+    fi
+}
+
+# Function to get file size from HDFS
+get_file_size() {
+    local file_path="$1"
+    local size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" | \
+        grep -i "Content-Length" | awk '{print $2}' | tr -d '\r')
+    echo "${size:-0}"
+}
+
+# Function to format file size
+format_size() {
+    local size=$1
+    if [ $size -ge 1073741824 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1073741824}")GB"
+    elif [ $size -ge 1048576 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1048576}")MB"
+    elif [ $size -ge 1024 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1024}")KB"
+    else
+        echo "${size}B"
+    fi
+}
+
+# Cleanup function
+cleanup() {
+    # Remove temporary directory
+    rm -rf "$TEMP_DIR"
+    
+    # Consolidate logs
+    write_to_consolidated_log "$APP_NAME" "${DATE_PATH:-nodate}"
+    rm -f "$LOG_FILE" "$LOG_FILE.lock"
+}
 
 trap cleanup EXIT
 main
