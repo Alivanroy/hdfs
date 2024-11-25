@@ -55,7 +55,7 @@ validate_date() {
 acquire_lock() {
     local lock_file="$1"
     local wait_time=0
-    local max_wait=300  # 5 minutes maximum wait time
+    local max_wait=300
     
     while ! mkdir "$lock_file" 2>/dev/null; do
         wait_time=$((wait_time + 1))
@@ -84,7 +84,6 @@ rotate_old_data() {
     if acquire_lock "$rotation_lock"; then
         log_message "INFO" "Starting data rotation" "\"retention_days\":${DATA_RETENTION_DAYS}"
         
-        # Find and delete old data directories
         find "$base_dir" -maxdepth 1 -type d -mtime +${DATA_RETENTION_DAYS} | while read dir; do
             if [[ "$dir" != "$base_dir" && "$dir" != "${base_dir}/temp" ]]; then
                 local dir_date=$(basename "$dir")
@@ -110,11 +109,9 @@ setup_logging() {
     chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_DIR"
     
     LOG_FILE="${LOG_DIR}/${app}_${date_path}_${PROCESS_ID}.log"
-    
     touch "$LOG_FILE"
     chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_FILE"
     
-    # Rotate old logs
     local rotation_lock="${LOCK_DIR}/rotation.lock"
     if acquire_lock "$rotation_lock"; then
         find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +${LOG_RETENTION_DAYS} -delete
@@ -127,9 +124,7 @@ log_message() {
     local level="$1"
     local message="$2"
     local additional_fields="$3"
-    
     local timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
-    
     local log_entry="{\"timestamp\":\"${timestamp}\",\"level\":\"${level}\",\"app\":\"${APP_NAME}\",\"process_id\":\"${PROCESS_ID}\",\"message\":\"${message}\""
     
     if [ ! -z "$additional_fields" ]; then
@@ -138,7 +133,6 @@ log_message() {
     
     log_entry="${log_entry}}"
     
-    # Use flock for atomic writes
     (
         flock -x 200
         echo "$log_entry" >> "$LOG_FILE"
@@ -184,7 +178,7 @@ format_size() {
     fi
 }
 
-# Function to safely move files to final location
+# Function to safely move files
 move_to_final_location() {
     local temp_file="$1"
     local final_file="$2"
@@ -200,16 +194,19 @@ move_to_final_location() {
     return 1
 }
 
-# Modified download_file function to handle paths without dates
+# Download file function with proper path handling
 download_file() {
     local base_path="$1"
     local file_path="$2"
     local filename=$(basename "$file_path")
-    local relative_path=$(dirname "${file_path#$base_path}")
-    local temp_file="${TEMP_DIR}/${filename}"
-    local final_file="${LOCAL_DIR}${relative_path}/${filename}"
     
-    # Create directory structure
+    local relative_path="${file_path#$base_path}"
+    relative_path="$(dirname "$relative_path")"
+    relative_path="${relative_path#/}"
+    
+    local temp_file="${TEMP_DIR}/${filename}"
+    local final_file="${LOCAL_DIR}/${relative_path}/${filename}"
+    
     mkdir -p "$(dirname "$final_file")"
     
     if [ -f "$final_file" ]; then
@@ -224,7 +221,6 @@ download_file() {
     
     local start_time=$(date +%s)
     
-    # Download to temporary location
     curl -s -k -L -o "$temp_file" \
         -u "${KNOX_USER}:${KNOX_PASSWORD}" \
         "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
@@ -241,7 +237,6 @@ download_file() {
     chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$temp_file"
     chmod 644 "$temp_file"
     
-    # Move to final location
     if move_to_final_location "$temp_file" "$final_file"; then
         log_message "INFO" "Download completed" "\"file\":\"${filename}\",\"size\":\"${formatted_size}\",\"duration_seconds\":${duration},\"status\":\"success\""
         return 0
@@ -259,7 +254,6 @@ cleanup() {
     rm -f "$LOG_FILE" "$LOG_FILE.lock"
 }
 
-# Register cleanup on script exit
 trap cleanup EXIT
 
 # Main execution function
@@ -273,7 +267,6 @@ main() {
     
     for base_path in "${BASE_PATHS[@]}"; do
         local hdfs_path="$base_path"
-        # Append date to path if provided
         if [ ! -z "$DATE_PATH" ]; then
             hdfs_path="${base_path}/${DATE_PATH}"
         fi
@@ -314,7 +307,7 @@ if [ ! -z "$DATE_PATH" ]; then
     if ! validate_date "$DATE_PATH"; then
         exit 1
     fi
-    LOCAL_DIR="${LOCAL_DIR}/${DATE_PATH}"
+    LOCAL_DIR="${OUTPUT_DIR}/${APP_NAME}/${DATE_PATH}"
 fi
 
 TEMP_DIR="${OUTPUT_DIR}/${APP_NAME}/temp/${PROCESS_ID}"
@@ -325,6 +318,5 @@ chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOCAL_DIR"
 chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$TEMP_DIR"
 
 setup_logging "$APP_NAME" "${DATE_PATH:-nodate}"
-trap cleanup EXIT
 
 main
