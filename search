@@ -1,0 +1,10 @@
+| rest /servicesNS/-/-/saved/searches 
+| rename eai:acl.app as app, title as saved_search_name, search as search_string 
+| append [| rest /servicesNS/-/-/data/ui/views 
+    | rename eai:acl.app as app, label as dashboard_name 
+    | spath input=eai:data path=search output=search_string 
+    | mvexpand search_string] 
+| eval source_type=if(isnull(dashboard_name), "Saved Search", "Dashboard") 
+| eval source_name=coalesce(saved_search_name,dashboard_name) 
+| table app source_type source_name search_string 
+| sort app source_type source_name
