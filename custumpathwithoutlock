@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# Script to download files from HDFS through Knox Gateway.
+# Usage: ./knox_hdfs_download.sh <app_name> <base_path1,base_path2,...> [date] [output_dir]
+# Files will be written directly to output_dir without creating subdirectories
+
+set -e
+
+#------------------------------------------------------------------------------
+# Configuration
+#------------------------------------------------------------------------------
+KNOX_HOST="web:9443"
+KNOX_BASE_PATH="/gateway/cdp-proxy-api/webhdfs/v1"
+DEFAULT_OUTPUT_DIR="/opt/splunk/data"
+LOG_DIR="/var/log/hdfs_downloads"
+LOG_RETENTION_DAYS=7
+
+SPLUNK_USER="splunk"
+SPLUNK_GROUP="splunk"
+
+KNOX_USER="your_username_here"
+KNOX_PASSWORD="your_password_here"
+
+# Generate a unique process ID for logging purposes
+PROCESS_ID="$$_$(date +%s%N)"
+
+#------------------------------------------------------------------------------
+# Function to validate date format
+#------------------------------------------------------------------------------
+validate_date() {
+    local date_str="$1"
+    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
+        log_message "ERROR" "Invalid date format. Expected YYYYMMDD" "\"date\":\"${date_str}\""
+        return 1
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# Function to validate output directory
+#------------------------------------------------------------------------------
+validate_output_dir() {
+    local dir="$1"
+    if [ ! -d "$dir" ]; then
+        if ! mkdir -p "$dir" 2>/dev/null; then
+            log_message "ERROR" "Cannot create output directory" "\"directory\":\"${dir}\""
+            return 1
+        fi
+    fi
+    if [ ! -w "$dir" ]; then
+        log_message "ERROR" "Output directory is not writable" "\"directory\":\"${dir}\""
+        return 1
+    fi
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# Setup logging
+#------------------------------------------------------------------------------
+setup_logging() {
+    local app="$1"
+    local date_path="$2"
+    
+    mkdir -p "$LOG_DIR"
+    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$LOG_DIR"
+    
+    # Define log file with date and process ID
+    LOG_FILE="${LOG_DIR}/${app}_${date_path}_${PROCESS_ID}.log"
+    
+    touch "$LOG_FILE"
+    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$LOG_FILE"
+    
+    # Rotate old logs (older than LOG_RETENTION_DAYS)
+    find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +"${LOG_RETENTION_DAYS}" -delete
+}
+
+#------------------------------------------------------------------------------
+# Function to log messages with JSON format
+#------------------------------------------------------------------------------
+log_message() {
+    local level="$1"
+    local message="$2"
+    local additional_fields="$3"
+    
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    
+    local log_entry="{\"timestamp\":\"${timestamp}\",\"level\":\"${level}\",\"app\":\"${APP_NAME}\",\"process_id\":\"${PROCESS_ID}\",\"message\":\"${message}\""
+    
+    if [ -n "$additional_fields" ]; then
+        log_entry="${log_entry},${additional_fields}"
+    fi
+    
+    log_entry="${log_entry}}"
+    
+    # Write to local log file
+    echo "$log_entry" >> "$LOG_FILE"
+    
+    # Also output to stdout (for Control-M or general visibility)
+    echo "$log_entry"
+}
+
+#------------------------------------------------------------------------------
+# Function to write to consolidated log (optional)
+#------------------------------------------------------------------------------
+write_to_consolidated_log() {
+    local app="$1"
+    local date_path="$2"
+    local consolidated_log="${LOG_DIR}/${app}_${date_path}.log"
+    
+    # Simply append to the consolidated log
+    cat "$LOG_FILE" >> "$consolidated_log"
+    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$consolidated_log"
+}
+
+#------------------------------------------------------------------------------
+# Function to get file size from HDFS
+#------------------------------------------------------------------------------
+get_file_size() {
+    local file_path="$1"
+    local size
+    size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" \
+        | grep -i "Content-Length" \
+        | awk '{print $2}' \
+        | tr -d '\r')
+    
+    echo "${size:-0}"
+}
+
+#------------------------------------------------------------------------------
+# Function to format file size
+#------------------------------------------------------------------------------
+format_size() {
+    local size="$1"
+    if [ "$size" -ge 1073741824 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1073741824}")GB"
+    elif [ "$size" -ge 1048576 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1048576}")MB"
+    elif [ "$size" -ge 1024 ]; then
+        echo "$(awk "BEGIN {printf \"%.2f\", $size/1024}")KB"
+    else
+        echo "${size}B"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Function to download a file from HDFS and place it in the output directory
+#------------------------------------------------------------------------------
+download_file() {
+    local file_path="$1"
+    local filename
+    filename=$(basename "$file_path")
+    
+    local temp_file="${TEMP_DIR}/${filename}"
+    local final_file="${OUTPUT_DIR}/${filename}"
+    
+    # Skip if file already exists
+    if [ -f "$final_file" ]; then
+        log_message "INFO" "File already exists" "\"file\":\"${filename}\",\"path\":\"${file_path}\",\"status\":\"skipped\""
+        return 0
+    fi
+    
+    local file_size
+    file_size=$(get_file_size "$file_path")
+    local formatted_size
+    formatted_size=$(format_size "$file_size")
+    
+    log_message "INFO" "Starting download" "\"file\":\"${filename}\",\"path\":\"${file_path}\",\"size\":\"${formatted_size}\""
+    
+    local start_time
+    start_time=$(date +%s)
+    
+    curl -s -k -L -o "$temp_file" \
+         -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+         "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
+    
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # Check if download was successful and file is not empty
+    if [ $? -ne 0 ] || [ ! -s "$temp_file" ]; then
+        log_message "ERROR" "Download failed" "\"file\":\"${filename}\",\"path\":\"${file_path}\""
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$temp_file"
+    chmod 644 "$temp_file"
+    
+    # Move file into final location
+    mv "$temp_file" "$final_file"
+    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$final_file"
+    chmod 644 "$final_file"
+    
+    log_message "INFO" "Download completed" "\"file\":\"${filename}\",\"path\":\"${file_path}\",\"duration_seconds\":${duration}"
+    return 0
+}
+
+#------------------------------------------------------------------------------
+# Cleanup function
+#------------------------------------------------------------------------------
+cleanup() {
+    # Remove temporary directory
+    rm -rf "$TEMP_DIR"
+    
+    # Consolidate logs
+    write_to_consolidated_log "$APP_NAME" "$DATE_PATH"
+    
+    # Remove the process-specific log
+    rm -f "$LOG_FILE"
+}
+
+#------------------------------------------------------------------------------
+# Main function
+#------------------------------------------------------------------------------
+main() {
+    log_message "INFO" "Starting HDFS download process" "\"paths\":\"${BASE_PATHS}\",\"date\":\"${DATE_PATH}\",\"output_dir\":\"${OUTPUT_DIR}\""
+    
+    local total_success=0
+    local total_files=0
+    
+    IFS=',' read -ra PATHS <<< "$BASE_PATHS"
+    for base_path in "${PATHS[@]}"; do
+        local hdfs_path
+        if [ "$DATE_PATH" = "00000000" ]; then
+            hdfs_path="${base_path}"
+        else
+            hdfs_path="${base_path}/${DATE_PATH}"
+        fi
+        
+        log_message "INFO" "Processing path" "\"path\":\"${hdfs_path}\""
+        
+        local files_list
+        files_list=$(curl -s -k -L \
+            -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+            "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" \
+            | grep -o '"pathSuffix":"[^"]*"' \
+            | cut -d'"' -f4)
+        
+        if [ -z "$files_list" ]; then
+            log_message "ERROR" "No files found" "\"path\":\"${hdfs_path}\""
+            continue
+        fi
+        
+        while IFS= read -r file; do
+            if [ -n "$file" ]; then
+                total_files=$((total_files + 1))
+                if download_file "${hdfs_path}/${file}"; then
+                    total_success=$((total_success + 1))
+                fi
+            fi
+        done <<< "$files_list"
+    done
+    
+    log_message "INFO" "Process completed" "\"total_files\":${total_files},\"successful\":${total_success}"
+    
+    if [ $total_success -ne $total_files ]; then
+        log_message "ERROR" "Some downloads failed" "\"failed\":$((total_files - total_success))"
+        exit 1
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Parse input parameters
+#------------------------------------------------------------------------------
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <app_name> <base_path1,base_path2,...> [date] [output_dir]"
+    exit 1
+fi
+
+APP_NAME="$1"
+BASE_PATHS="$2"
+
+# Default the date to "00000000" if not provided
+DATE_PATH="${3:-00000000}"
+
+if [ "$DATE_PATH" != "00000000" ] && ! validate_date "$DATE_PATH"; then
+    exit 1
+fi
+
+OUTPUT_DIR="${4:-$DEFAULT_OUTPUT_DIR}"
+
+# Validate output directory
+if ! validate_output_dir "$OUTPUT_DIR"; then
+    exit 1
+fi
+
+# Prepare logging
+setup_logging "$APP_NAME" "$DATE_PATH"
+
+# Create temporary directory for downloads
+TEMP_DIR="/tmp/hdfs_download_${PROCESS_ID}"
+mkdir -p "$TEMP_DIR"
+chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "$TEMP_DIR"
+
+trap cleanup EXIT
+
+# Execute main logic
+main
