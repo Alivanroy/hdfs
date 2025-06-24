@@ -61,7 +61,8 @@ release_lock() {
 # Function to validate single date format
 validate_date() {
     local date_str="$1"
-    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
+    # Check if it's exactly 8 digits
+    if [[ ${#date_str} -ne 8 ]] || [[ ! "$date_str" =~ ^[0-9]+$ ]]; then
         return 1
     fi
     
@@ -86,7 +87,7 @@ parse_date_range() {
     local dates=()
     
     # Check if it's a range (contains - or ,)
-    if [[ "$date_input" =~ ^[0-9]{8}[-,][0-9]{8}$ ]]; then
+    if [[ "$date_input" == *"-"* || "$date_input" == *","* ]]; then
         local start_date
         local end_date
         
@@ -98,7 +99,7 @@ parse_date_range() {
             end_date="${date_input#*,}"
         fi
         
-        # Validate start and end dates
+        # Validate both parts are valid dates
         if ! validate_date "$start_date" || ! validate_date "$end_date"; then
             log_message "ERROR" "Invalid date format in range" "\"range\":\"${date_input}\""
             return 1
@@ -111,7 +112,7 @@ parse_date_range() {
             current_date=$(date -d "$current_date + 1 day" '+%Y%m%d')
         done
         
-    elif [[ "$date_input" =~ ^[0-9]{8}$ ]]; then
+    elif [[ ${#date_input} -eq 8 && "$date_input" =~ ^[0-9]+$ ]]; then
         # Single date
         if ! validate_date "$date_input"; then
             log_message "ERROR" "Invalid date format" "\"date\":\"${date_input}\""
@@ -427,7 +428,7 @@ fi
 # Create date identifier for logging
 if [ "$DATE_INPUT" = "00000000" ]; then
     DATE_IDENTIFIER="nodate"
-elif [[ "$DATE_INPUT" =~ ^[0-9]{8}[-,][0-9]{8}$ ]]; then
+elif [[ "$DATE_INPUT" == *"-"* || "$DATE_INPUT" == *","* ]]; then
     DATE_IDENTIFIER="range_$(echo "$DATE_INPUT" | tr '-,' '_')"
 else
     DATE_IDENTIFIER="$DATE_INPUT"
