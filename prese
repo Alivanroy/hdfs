@@ -79,6 +79,300 @@ index=_internal source="*dbx*" | table _time user database_connection sql_query
 | **Extension** | 6 sem | Sales + Finance | Généralisation modèle RBAC |
 | **Production** | 4 sem | Tous utilisateurs | Déploiement complet + monitoring |
 
+## **🔍 FILTRAGE PAR RÔLES SPLUNK - POSSIBILITÉS ET LIMITATIONS**
+
+### **✅ Ce qui EST possible**
+
+| **Type de Filtrage** | **Méthode** | **Application** | **Efficacité** |
+|----------------------|-------------|-----------------|----------------|
+| **Search Filters** | `srchFilter` dans authorize.conf | Toutes recherches du rôle | ⚠️ Global (pas spécifique DB Connect) |
+| **Field Filtering** | `fieldFilter-<field>` | Masquage de champs sensibles | ✅ Efficace pour PII/PHI |
+| **Connection Access** | Permissions DB Connect | Accès aux connexions par rôle | ✅ Ségrégation complète |
+| **SQL-level Filtering** | Vues/Politiques base de données | Filtrage dans Snowflake | ✅ **RECOMMANDÉ** |
+
+### **❌ Limitations importantes**
+
+#### **1. Search Filters = Filtrage global**
+```splunk
+[hr_role]
+srchFilter = department="HR"
+
+# Problème: S'applique à TOUTES les recherches
+index=web | stats count              # ← Filtré aussi !
+| dbxquery query="SELECT * FROM emp" # ← Filtré (voulu)
+```
+
+#### **2. dbxquery ignore les contraintes temporelles**
+```splunk
+# ❌ Ne fonctionne PAS comme attendu
+earliest=-24h | dbxquery query="SELECT * FROM sales"  
+
+# ✅ Correct - filtre dans le SQL
+| dbxquery query="SELECT * FROM sales WHERE date >= CURRENT_DATE - 1"
+```
+
+### **🎯 STRATÉGIES DE FILTRAGE RECOMMANDÉES**
+
+#### **Stratégie 1: Filtrage SQL + Vues dédiées (OPTIMAL)**
+```sql
+-- Créer des vues par domaine métier dans Snowflake
+CREATE VIEW v_employees_hr AS 
+SELECT emp_id, name, department, salary 
+FROM employees 
+WHERE department = 'HR' 
+  AND CURRENT_ROLE() = 'HR_READ_ROLE';
+
+CREATE VIEW v_employees_sales AS 
+SELECT emp_id, name, department, commission 
+FROM employees 
+WHERE department = 'SALES'
+  AND CURRENT_ROLE() = 'SALES_READ_ROLE';
+```
+
+#### **Stratégie 2: Comptes DB spécialisés + Row-Level Security**
+```sql
+-- Compte dédié avec accès limité
+GRANT SELECT ON SCHEMA prod.hr TO ROLE splunk_hr_ro;
+GRANT SELECT ON SCHEMA prod.sales TO ROLE splunk_sales_ro;
+
+-- Politique de sécurité au niveau ligne
+CREATE ROW ACCESS POLICY dept_filter AS (dept varchar) RETURNS BOOLEAN ->
+  CASE WHEN CURRENT_ROLE() = 'SPLUNK_HR_RO' AND dept = 'HR' THEN TRUE
+       WHEN CURRENT_ROLE() = 'SPLUNK_SALES_RO' AND dept = 'SALES' THEN TRUE
+       ELSE FALSE END;
+```
+
+#### **Stratégie 3: Macro Splunk avec validation de rôle**
+```splunk
+# Définir une macro avec validation
+[dbquery_secure(2)]
+definition = | rest /services/authentication/current-context | eval allowed_connection=if(match('$connection
+
+| **Risque** | **Impact** | **Mitigation** |
+|------------|------------|----------------|
+| **Fuite données** | 🔴 CRITIQUE | RBAC + chiffrement + row-level security + audit |
+| **Compromission credentials** | 🔴 CRITIQUE | Rotation auto + MFA + comptes dédiés + vault |
+| **Déni de service** | 🟡 MOYEN | Load balancing + monitoring + quotas Snowflake |
+| **Non-conformité RGPD** | 🔴 CRITIQUE | Data masking + audit trail + procédures DPO |
+
+---
+
+## **✅ VALIDATION SÉCURITÉ - CHECKLIST**
+
+### **Tests Réalisés**
+- ✅ Penetration testing connexions DB
+- ✅ Vulnerability assessment composants
+- ✅ Tests de charge avec monitoring sécurité
+- ✅ Validation ségrégation des données
+
+### **Documentation Livrée**
+- ✅ Architecture security + diagrammes flux
+- ✅ Runbooks opérationnels step-by-step
+- ✅ Playbooks incident response
+- ✅ Procédures formation équipes
+
+### **Critères de Succès**
+- 🎯 **0 incident** fuite données entre domaines
+- 🎯 **< 24h** traitement demande habilitation
+- 🎯 **100%** requêtes tracées et auditables
+- 🎯 **Satisfaction utilisateur** accès fluide aux données autorisées
+
+---
+
+## **❓ QUESTIONS SÉCURITÉ ADDITIONNELLES ANTICIPÉES**
+
+<details>
+<summary><strong>Cliquer pour voir la liste complète (21 questions)</strong></summary>
+
+**Chiffrement:** Niveau TLS, rotation clés, certificats  
+**Authentification:** MFA, SSO, key-pair auth  
+**Réseau:** Private Link, whitelist IP, monitoring flux  
+**Conformité:** RGPD, PII masking, DPA Snowflake  
+**Continuité:** HA, RTO/RPO, plan reprise activité  
+**Tests:** Pentest, CVE management, code review  
+**Documentation:** Runbooks, formation, incident response  
+**Risques:** Matrice formalisée, budget sécurité, ressources
+
+</details>
+
+---
+
+## **🏁 DÉCISION & PROCHAINES ÉTAPES**
+
+### **Recommandation:** ✅ **VALIDATION ARCHITECTURE SÉCURISÉE**
+- Architecture **defense in depth** avec contrôles multi-niveaux
+- **RBAC granulaire** respectant principe moindre privilège  
+- **Audit trail complet** pour conformité et investigation
+- **Tests sécurité** validés et documentation complète
+
+### **Actions Immédiates:**
+1. **Validation SRO** de l'architecture proposée
+2. **Lancement phase pilote** avec équipe RH
+3. **Mise en place monitoring** et alertes sécurité
+4. **Formation équipes** sur procédures sécurisées
+
+---
+
+**📞 Contact:** Équipe Architecture Data | **📝 Docs:** Confluence > Data Platform > DB Connect Security, case(match(roles, "hr_"), "snowflake_hr", match(roles, "sales_"), "snowflake_sales", 1=1, "none")), '$connection
+
+| **Risque** | **Impact** | **Mitigation** |
+|------------|------------|----------------|
+| **Fuite données** | 🔴 CRITIQUE | RBAC + chiffrement + row-level security + audit |
+| **Compromission credentials** | 🔴 CRITIQUE | Rotation auto + MFA + comptes dédiés + vault |
+| **Déni de service** | 🟡 MOYEN | Load balancing + monitoring + quotas Snowflake |
+| **Non-conformité RGPD** | 🔴 CRITIQUE | Data masking + audit trail + procédures DPO |
+
+---
+
+## **✅ VALIDATION SÉCURITÉ - CHECKLIST**
+
+### **Tests Réalisés**
+- ✅ Penetration testing connexions DB
+- ✅ Vulnerability assessment composants
+- ✅ Tests de charge avec monitoring sécurité
+- ✅ Validation ségrégation des données
+
+### **Documentation Livrée**
+- ✅ Architecture security + diagrammes flux
+- ✅ Runbooks opérationnels step-by-step
+- ✅ Playbooks incident response
+- ✅ Procédures formation équipes
+
+### **Critères de Succès**
+- 🎯 **0 incident** fuite données entre domaines
+- 🎯 **< 24h** traitement demande habilitation
+- 🎯 **100%** requêtes tracées et auditables
+- 🎯 **Satisfaction utilisateur** accès fluide aux données autorisées
+
+---
+
+## **❓ QUESTIONS SÉCURITÉ ADDITIONNELLES ANTICIPÉES**
+
+<details>
+<summary><strong>Cliquer pour voir la liste complète (21 questions)</strong></summary>
+
+**Chiffrement:** Niveau TLS, rotation clés, certificats  
+**Authentification:** MFA, SSO, key-pair auth  
+**Réseau:** Private Link, whitelist IP, monitoring flux  
+**Conformité:** RGPD, PII masking, DPA Snowflake  
+**Continuité:** HA, RTO/RPO, plan reprise activité  
+**Tests:** Pentest, CVE management, code review  
+**Documentation:** Runbooks, formation, incident response  
+**Risques:** Matrice formalisée, budget sécurité, ressources
+
+</details>
+
+---
+
+## **🏁 DÉCISION & PROCHAINES ÉTAPES**
+
+### **Recommandation:** ✅ **VALIDATION ARCHITECTURE SÉCURISÉE**
+- Architecture **defense in depth** avec contrôles multi-niveaux
+- **RBAC granulaire** respectant principe moindre privilège  
+- **Audit trail complet** pour conformité et investigation
+- **Tests sécurité** validés et documentation complète
+
+### **Actions Immédiates:**
+1. **Validation SRO** de l'architecture proposée
+2. **Lancement phase pilote** avec équipe RH
+3. **Mise en place monitoring** et alertes sécurité
+4. **Formation équipes** sur procédures sécurisées
+
+---
+
+**📞 Contact:** Équipe Architecture Data | **📝 Docs:** Confluence > Data Platform > DB Connect Security, "unauthorized") | eval query=if(allowed_connection!="unauthorized", '$query
+
+| **Risque** | **Impact** | **Mitigation** |
+|------------|------------|----------------|
+| **Fuite données** | 🔴 CRITIQUE | RBAC + chiffrement + row-level security + audit |
+| **Compromission credentials** | 🔴 CRITIQUE | Rotation auto + MFA + comptes dédiés + vault |
+| **Déni de service** | 🟡 MOYEN | Load balancing + monitoring + quotas Snowflake |
+| **Non-conformité RGPD** | 🔴 CRITIQUE | Data masking + audit trail + procédures DPO |
+
+---
+
+## **✅ VALIDATION SÉCURITÉ - CHECKLIST**
+
+### **Tests Réalisés**
+- ✅ Penetration testing connexions DB
+- ✅ Vulnerability assessment composants
+- ✅ Tests de charge avec monitoring sécurité
+- ✅ Validation ségrégation des données
+
+### **Documentation Livrée**
+- ✅ Architecture security + diagrammes flux
+- ✅ Runbooks opérationnels step-by-step
+- ✅ Playbooks incident response
+- ✅ Procédures formation équipes
+
+### **Critères de Succès**
+- 🎯 **0 incident** fuite données entre domaines
+- 🎯 **< 24h** traitement demande habilitation
+- 🎯 **100%** requêtes tracées et auditables
+- 🎯 **Satisfaction utilisateur** accès fluide aux données autorisées
+
+---
+
+## **❓ QUESTIONS SÉCURITÉ ADDITIONNELLES ANTICIPÉES**
+
+<details>
+<summary><strong>Cliquer pour voir la liste complète (21 questions)</strong></summary>
+
+**Chiffrement:** Niveau TLS, rotation clés, certificats  
+**Authentification:** MFA, SSO, key-pair auth  
+**Réseau:** Private Link, whitelist IP, monitoring flux  
+**Conformité:** RGPD, PII masking, DPA Snowflake  
+**Continuité:** HA, RTO/RPO, plan reprise activité  
+**Tests:** Pentest, CVE management, code review  
+**Documentation:** Runbooks, formation, incident response  
+**Risques:** Matrice formalisée, budget sécurité, ressources
+
+</details>
+
+---
+
+## **🏁 DÉCISION & PROCHAINES ÉTAPES**
+
+### **Recommandation:** ✅ **VALIDATION ARCHITECTURE SÉCURISÉE**
+- Architecture **defense in depth** avec contrôles multi-niveaux
+- **RBAC granulaire** respectant principe moindre privilège  
+- **Audit trail complet** pour conformité et investigation
+- **Tests sécurité** validés et documentation complète
+
+### **Actions Immédiates:**
+1. **Validation SRO** de l'architecture proposée
+2. **Lancement phase pilote** avec équipe RH
+3. **Mise en place monitoring** et alertes sécurité
+4. **Formation équipes** sur procédures sécurisées
+
+---
+
+**📞 Contact:** Équipe Architecture Data | **📝 Docs:** Confluence > Data Platform > DB Connect Security, "SELECT 'Access Denied' as error") | dbxquery connection=allowed_connection query=query
+
+# Utilisation sécurisée
+`dbquery_secure("snowflake_hr", "SELECT * FROM employees")`
+```
+
+### **🛡️ CONTRÔLES SUPPLÉMENTAIRES**
+
+#### **Field Filtering pour données sensibles**
+```splunk
+# authorize.conf - Masquage automatique
+[hr_analyst]
+fieldFilter-salary = [SHA256]     # Hash les salaires
+fieldFilter-ssn = null           # Supprime les SSN
+fieldFilter-email = XXXX          # Masque les emails
+```
+
+#### **Monitoring et alertes**
+```splunk
+# Surveillance des tentatives d'accès non autorisé
+index=_internal source="*dbx*" "insufficient permissions" 
+| stats count by user connection_name
+| where count > 3
+| sendalert security_team
+```
+
 ---
 
 ## **⚠️ RISQUES & MITIGATIONS**
