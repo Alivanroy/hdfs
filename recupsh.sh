@@ -274,7 +274,7 @@ download_file() {
     local filename=$(basename "$file_path")
     
     local temp_file="${TEMP_DIR}/${filename}"
-    # Write directly to output directory without date subdirectories
+    # Always write directly to output directory without date subdirectories
     local final_file="${OUTPUT_DIR}/${filename}"
     
     # Skip if file exists
