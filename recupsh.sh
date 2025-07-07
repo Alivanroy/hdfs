@@ -1,16 +1,27 @@
 #!/bin/bash
 
-# Script to download files from HDFS through Knox Gateway directly to target directory
-# Usage: ./recup.sh <app_name> <hdfs_base_path> <date_range> <target_dir>
-# Example: ./recup.sh myapp "/prd/logs" "20250401-20250601" "/target/directory"
+# Script to download files from HDFS through Knox Gateway with concurrent execution support
+# Usage: ./knox_hdfs_download.sh <app_name> <base_path1,base_path2,...> [date|date_range] [output_dir]
+# 
+# Files will be written directly to output_dir without creating date subdirectories
+#
+# Date formats supported:
+#   - Single date: YYYYMMDD (e.g., 20240120)
+#   - Date range: YYYYMMDD-YYYYMMDD (e.g., 20240120-20240125)
+#   - Date range: YYYYMMDD,YYYYMMDD (e.g., 20240120,20240125)
+#   - No date: downloads from base paths without date subdirectory
+#
+# Examples:
+#   ./knox_hdfs_download.sh myapp "/path1,/path2" 20240120
+#   ./knox_hdfs_download.sh myapp "/path1,/path2" 20240120-20240125
+#   ./knox_hdfs_download.sh myapp "/path1,/path2" 20240120,20240125 /custom/output
 
 set -e
 
-#------------------------------------------------------------------------------
 # Configuration
-#------------------------------------------------------------------------------
 KNOX_HOST="web:9443"
 KNOX_BASE_PATH="/gateway/cdp-proxy-api/webhdfs/v1"
+DEFAULT_OUTPUT_DIR="/opt/splunk/data"
 LOG_DIR="/var/log/hdfs_downloads"
 LOG_RETENTION_DAYS=7
 
@@ -20,321 +31,429 @@ SPLUNK_GROUP="splunk"
 KNOX_USER="your_username_here"
 KNOX_PASSWORD="your_password_here"
 
-# Generate a unique process ID for logging purposes
 PROCESS_ID="$$_$(date +%s%N)"
+LOCK_DIR="/var/lock/hdfs_downloads"
+mkdir -p "$LOCK_DIR"
+chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOCK_DIR"
 
-#------------------------------------------------------------------------------
-# Function to validate date format
-#------------------------------------------------------------------------------
-validate_date() {
-    local date_str="$1"
-    if [[ ! "$date_str" =~ ^[0-9]{8}$ ]]; then
-        log_message "ERROR" "Invalid date format. Expected YYYYMMDD" "\"date\":\"${date_str}\""
-        return 1
-    fi
+# Function to acquire lock
+acquire_lock() {
+    local lock_file="$1"
+    local wait_time=0
+    local max_wait=300  # 5 minutes maximum wait time
+    
+    while ! mkdir "$lock_file" 2>/dev/null; do
+        wait_time=$((wait_time + 1))
+        if [ $wait_time -ge $max_wait ]; then
+            echo "ERROR: Could not acquire lock after 5 minutes"
+            return 1
+        fi
+        sleep 1
+    done
+    chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$lock_file"
     return 0
 }
 
-#------------------------------------------------------------------------------
-# Function to parse date range
-#------------------------------------------------------------------------------
-parse_date_range() {
-    local date_range="$1"
-    if [[ "$date_range" =~ ^([0-9]{8})-([0-9]{8})$ ]]; then
-        START_DATE="${BASH_REMATCH[1]}"
-        END_DATE="${BASH_REMATCH[2]}"
-        
-        if ! validate_date "$START_DATE" || ! validate_date "$END_DATE"; then
-            return 1
-        fi
-        
-        # Check if start date is before or equal to end date
-        if [ "$START_DATE" -gt "$END_DATE" ]; then
-            log_message "ERROR" "Start date must be before or equal to end date" "\"start\":\"$START_DATE\",\"end\":\"$END_DATE\""
-            return 1
-        fi
-        
-        return 0
-    else
-        log_message "ERROR" "Invalid date range format. Expected YYYYMMDD-YYYYMMDD" "\"range\":\"$date_range\""
+# Function to release lock
+release_lock() {
+    local lock_file="$1"
+    rm -rf "$lock_file"
+}
+
+# Function to validate single date format
+validate_date() {
+    local date_str="$1"
+    # Check if it's exactly 8 digits
+    if [ ${#date_str} -ne 8 ]; then
         return 1
     fi
-}
-
-#------------------------------------------------------------------------------
-# Function to generate date list between start and end dates
-#------------------------------------------------------------------------------
-generate_date_list() {
-    local start_date="$1"
-    local end_date="$2"
-    local current_date="$start_date"
     
-    while [ "$current_date" -le "$end_date" ]; do
-        echo "$current_date"
-        # Increment date by one day
-        current_date=$(date -d "${current_date:0:4}-${current_date:4:2}-${current_date:6:2} + 1 day" +%Y%m%d)
-    done
+    # Check if it contains only digits
+    case "$date_str" in
+        ''|*[!0-9]*) return 1 ;;
+        *) ;;
+    esac
+    
+    # Additional validation for valid date
+    local year="${date_str:0:4}"
+    local month="${date_str:4:2}"
+    local day="${date_str:6:2}"
+    
+    if [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
+        return 1
+    fi
+    if [ "$day" -lt 1 ] || [ "$day" -gt 31 ]; then
+        return 1
+    fi
+    
+    return 0
 }
 
-#------------------------------------------------------------------------------
-# Function to validate target directory
-#------------------------------------------------------------------------------
-validate_target_dir() {
+# Function to parse date range and return array of dates
+parse_date_range() {
+    local date_input="$1"
+    local dates=()
+    
+    # Check if it's a range (contains - or ,)
+    if [[ "$date_input" == *"-"* || "$date_input" == *","* ]]; then
+        local start_date
+        local end_date
+        
+        if [[ "$date_input" == *"-"* ]]; then
+            start_date="${date_input%-*}"
+            end_date="${date_input#*-}"
+        else
+            start_date="${date_input%,*}"
+            end_date="${date_input#*,}"
+        fi
+        
+        # Validate both parts are valid dates
+        if ! validate_date "$start_date" || ! validate_date "$end_date"; then
+            log_message "ERROR" "Invalid date format in range" "\"range\":\"${date_input}\""
+            return 1
+        fi
+        
+        # Generate date range
+        local current_date="$start_date"
+        while [[ "$current_date" <= "$end_date" ]]; do
+            dates+=("$current_date")
+            current_date=$(date -d "$current_date + 1 day" '+%Y%m%d')
+        done
+        
+    elif [ ${#date_input} -eq 8 ]; then
+        # Single date - check if it contains only digits
+        case "$date_input" in
+            ''|*[!0-9]*) 
+                log_message "ERROR" "Invalid date format" "\"date\":\"${date_input}\""
+                return 1 
+                ;;
+            *)
+                if ! validate_date "$date_input"; then
+                    log_message "ERROR" "Invalid date format" "\"date\":\"${date_input}\""
+                    return 1
+                fi
+                dates+=("$date_input")
+                ;;
+        esac
+        
+    elif [ "$date_input" = "00000000" ]; then
+        # No date mode
+        dates+=("00000000")
+        
+    else
+        log_message "ERROR" "Invalid date format" "\"input\":\"${date_input}\""
+        return 1
+    fi
+    
+    # Return dates as space-separated string
+    echo "${dates[@]}"
+    return 0
+}
+
+# Function to validate output directory
+validate_output_dir() {
     local dir="$1"
     if [ ! -d "$dir" ]; then
         if ! mkdir -p "$dir" 2>/dev/null; then
-            log_message "ERROR" "Cannot create target directory" "\"directory\":\"${dir}\""
+            log_message "ERROR" "Cannot create output directory" "\"directory\":\"${dir}\""
             return 1
         fi
     fi
     if [ ! -w "$dir" ]; then
-        log_message "ERROR" "Target directory is not writable" "\"directory\":\"${dir}\""
+        log_message "ERROR" "Output directory is not writable" "\"directory\":\"${dir}\""
         return 1
     fi
     return 0
 }
 
-#------------------------------------------------------------------------------
-# Setup logging
-#------------------------------------------------------------------------------
+# Setup logging with process isolation
 setup_logging() {
     local app="$1"
+    local date_identifier="$2"
     
     mkdir -p "$LOG_DIR"
-    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$LOG_DIR"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_DIR"
     
-    # Define log file with app name and process ID
-    LOG_FILE="${LOG_DIR}/${app}_${PROCESS_ID}.log"
+    # Define log file with date and process ID
+    LOG_FILE="${LOG_DIR}/${app}_${date_identifier}_${PROCESS_ID}.log"
     
     touch "$LOG_FILE"
-    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$LOG_FILE"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$LOG_FILE"
     
-    # Rotate old logs (older than LOG_RETENTION_DAYS)
-    find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +"${LOG_RETENTION_DAYS}" -delete 2>/dev/null || true
+    # Rotate old logs
+    local rotation_lock="${LOCK_DIR}/rotation.lock"
+    if acquire_lock "$rotation_lock"; then
+        find "$LOG_DIR" -name "${app}_*.log" -type f -mtime +${LOG_RETENTION_DAYS} -delete
+        release_lock "$rotation_lock"
+    fi
 }
 
-#------------------------------------------------------------------------------
-# Function to log messages with JSON format
-#------------------------------------------------------------------------------
+# Function to log messages with JSON format and process ID
 log_message() {
     local level="$1"
     local message="$2"
     local additional_fields="$3"
     
-    local timestamp
-    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
+    local timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')
     
     local log_entry="{\"timestamp\":\"${timestamp}\",\"level\":\"${level}\",\"app\":\"${APP_NAME}\",\"process_id\":\"${PROCESS_ID}\",\"message\":\"${message}\""
     
-    if [ -n "$additional_fields" ]; then
+    if [ ! -z "$additional_fields" ]; then
         log_entry="${log_entry},${additional_fields}"
     fi
     
     log_entry="${log_entry}}"
     
-    # Write to local log file
-    echo "$log_entry" >> "$LOG_FILE"
+    # Use flock for atomic writes to log file
+    (
+        flock -x 200
+        echo "$log_entry" >> "$LOG_FILE"
+    ) 200>"$LOG_FILE.lock"
     
-    # Also output to stdout (for Control-M or general visibility)
+    # Also output to stdout for Control-M
     echo "$log_entry"
 }
 
-#------------------------------------------------------------------------------
+# Function to safely write to consolidated log
+write_to_consolidated_log() {
+    local app="$1"
+    local date_identifier="$2"
+    local consolidated_log="${LOG_DIR}/${app}_${date_identifier}.log"
+    local lock_file="${LOCK_DIR}/${app}_${date_identifier}.lock"
+    
+    if acquire_lock "$lock_file"; then
+        cat "$LOG_FILE" >> "$consolidated_log"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$consolidated_log"
+        release_lock "$lock_file"
+    fi
+}
+
 # Function to get file size from HDFS
-#------------------------------------------------------------------------------
 get_file_size() {
     local file_path="$1"
-    local size
-    size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
-        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" \
-        | grep -i "Content-Length" \
-        | awk '{print $2}' \
-        | tr -d '\r')
-    
+    local size=$(curl -s -k -I -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=GETFILESTATUS" | \
+        grep -i "Content-Length" | awk '{print $2}' | tr -d '\r')
     echo "${size:-0}"
 }
 
-#------------------------------------------------------------------------------
 # Function to format file size
-#------------------------------------------------------------------------------
 format_size() {
-    local size="$1"
-    if [ "$size" -ge 1073741824 ]; then
+    local size=$1
+    if [ $size -ge 1073741824 ]; then
         echo "$(awk "BEGIN {printf \"%.2f\", $size/1073741824}")GB"
-    elif [ "$size" -ge 1048576 ]; then
+    elif [ $size -ge 1048576 ]; then
         echo "$(awk "BEGIN {printf \"%.2f\", $size/1048576}")MB"
-    elif [ "$size" -ge 1024 ]; then
+    elif [ $size -ge 1024 ]; then
         echo "$(awk "BEGIN {printf \"%.2f\", $size/1024}")KB"
     else
         echo "${size}B"
     fi
 }
 
-#------------------------------------------------------------------------------
-# Function to download a file from HDFS and place it directly in target directory
-#------------------------------------------------------------------------------
+# Function to safely move files to final location
+move_to_final_location() {
+    local temp_file="$1"
+    local final_file="$2"
+    local lock_file="${LOCK_DIR}/$(basename "$final_file").lock"
+    
+    if acquire_lock "$lock_file"; then
+        mv "$temp_file" "$final_file"
+        chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$final_file"
+        chmod 644 "$final_file"
+        release_lock "$lock_file"
+        return 0
+    fi
+    return 1
+}
+
+# Function to download a single file - writes directly to output directory
 download_file() {
     local file_path="$1"
-    local date_processed="$2"
-    local filename
-    filename=$(basename "$file_path")
+    local current_date="$2"
+    local filename=$(basename "$file_path")
     
     local temp_file="${TEMP_DIR}/${filename}"
-    local final_file="${TARGET_DIR}/${filename}"
+    # Write directly to output directory without date subdirectories
+    local final_file="${OUTPUT_DIR}/${filename}"
     
-    # Skip if file already exists
+    # Skip if file exists
     if [ -f "$final_file" ]; then
-        log_message "INFO" "File already exists" "\"file\":\"${filename}\",\"date\":\"${date_processed}\",\"status\":\"skipped\""
+        log_message "INFO" "File already exists" "\"file\":\"${filename}\",\"date\":\"${current_date}\",\"path\":\"${file_path}\",\"status\":\"skipped\""
         return 0
     fi
     
-    local file_size
-    file_size=$(get_file_size "$file_path")
-    local formatted_size
-    formatted_size=$(format_size "$file_size")
+    local file_size=$(get_file_size "$file_path")
+    local formatted_size=$(format_size "$file_size")
     
-    log_message "INFO" "Starting download" "\"file\":\"${filename}\",\"date\":\"${date_processed}\",\"path\":\"${file_path}\",\"size\":\"${formatted_size}\""
+    log_message "INFO" "Starting download" "\"file\":\"${filename}\",\"date\":\"${current_date}\",\"path\":\"${file_path}\",\"size\":\"${formatted_size}\""
     
-    local start_time
-    start_time=$(date +%s)
+    local start_time=$(date +%s)
     
     curl -s -k -L -o "$temp_file" \
-         -u "${KNOX_USER}:${KNOX_PASSWORD}" \
-         "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
+        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+        "https://${KNOX_HOST}${KNOX_BASE_PATH}${file_path}?op=OPEN"
     
-    local end_time
-    end_time=$(date +%s)
+    local end_time=$(date +%s)
     local duration=$((end_time - start_time))
     
-    # Check if download was successful and file is not empty
     if [ $? -ne 0 ] || [ ! -s "$temp_file" ]; then
-        log_message "ERROR" "Download failed" "\"file\":\"${filename}\",\"date\":\"${date_processed}\",\"path\":\"${file_path}\""
+        log_message "ERROR" "Download failed" "\"file\":\"${filename}\",\"date\":\"${current_date}\",\"path\":\"${file_path}\""
         rm -f "$temp_file"
         return 1
     fi
     
-    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$temp_file"
+    chown ${SPLUNK_USER}:${SPLUNK_GROUP} "$temp_file"
     chmod 644 "$temp_file"
     
-    # Move file into final location
-    mv "$temp_file" "$final_file"
-    chown "${SPLUNK_USER}:${SPLUNK_GROUP}" "$final_file"
-    chmod 644 "$final_file"
-    
-    log_message "INFO" "Download completed" "\"file\":\"${filename}\",\"date\":\"${date_processed}\",\"path\":\"${file_path}\",\"duration_seconds\":${duration}"
-    return 0
+    if move_to_final_location "$temp_file" "$final_file"; then
+        log_message "INFO" "Download completed" "\"file\":\"${filename}\",\"date\":\"${current_date}\",\"path\":\"${file_path}\",\"duration_seconds\":${duration}"
+        return 0
+    else
+        log_message "ERROR" "Failed to move file" "\"file\":\"${filename}\",\"date\":\"${current_date}\",\"path\":\"${file_path}\""
+        rm -f "$temp_file"
+        return 1
+    fi
 }
 
-#------------------------------------------------------------------------------
 # Function to process a single date
-#------------------------------------------------------------------------------
 process_date() {
-    local date_to_process="$1"
-    local hdfs_path="${HDFS_BASE_PATH}/${date_to_process}"
-    
-    log_message "INFO" "Processing date" "\"date\":\"${date_to_process}\",\"path\":\"${hdfs_path}\""
-    
-    local files_list
-    files_list=$(curl -s -k -L \
-        -u "${KNOX_USER}:${KNOX_PASSWORD}" \
-        "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" \
-        | grep -o '"pathSuffix":"[^"]*"' \
-        | cut -d'"' -f4)
-    
-    if [ -z "$files_list" ]; then
-        log_message "WARN" "No files found for date" "\"date\":\"${date_to_process}\",\"path\":\"${hdfs_path}\""
-        return 0
-    fi
+    local current_date="$1"
+    local paths_array=("${@:2}")
     
     local date_success=0
     local date_total=0
     
-    while IFS= read -r file; do
-        if [ -n "$file" ]; then
-            date_total=$((date_total + 1))
-            if download_file "${hdfs_path}/${file}" "${date_to_process}"; then
-                date_success=$((date_success + 1))
-            fi
+    log_message "INFO" "Processing date" "\"date\":\"${current_date}\""
+    
+    for base_path in "${paths_array[@]}"; do
+        local hdfs_path
+        if [ "$current_date" = "00000000" ]; then
+            hdfs_path="${base_path}"
+        else
+            hdfs_path="${base_path}/${current_date}"
         fi
-    done <<< "$files_list"
+        
+        log_message "INFO" "Processing path for date" "\"path\":\"${hdfs_path}\",\"date\":\"${current_date}\""
+        
+        local files_list=$(curl -s -k -L \
+            -u "${KNOX_USER}:${KNOX_PASSWORD}" \
+            "https://${KNOX_HOST}${KNOX_BASE_PATH}${hdfs_path}?op=LISTSTATUS" | \
+            grep -o '"pathSuffix":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ -z "$files_list" ]; then
+            log_message "WARN" "No files found" "\"path\":\"${hdfs_path}\",\"date\":\"${current_date}\""
+            continue
+        fi
+        
+        while IFS= read -r file; do
+            if [ ! -z "$file" ]; then
+                date_total=$((date_total + 1))
+                if download_file "${hdfs_path}/${file}" "$current_date"; then
+                    date_success=$((date_success + 1))
+                fi
+            fi
+        done <<< "$files_list"
+    done
     
-    log_message "INFO" "Date processing completed" "\"date\":\"${date_to_process}\",\"total_files\":${date_total},\"successful\":${date_success}"
+    log_message "INFO" "Date processing completed" "\"date\":\"${current_date}\",\"total_files\":${date_total},\"successful\":${date_success}"
     
-    return $([ $date_success -eq $date_total ])
+    # Return success if all files for this date were downloaded
+    [ $date_success -eq $date_total ]
 }
 
-#------------------------------------------------------------------------------
 # Cleanup function
-#------------------------------------------------------------------------------
 cleanup() {
     # Remove temporary directory
     rm -rf "$TEMP_DIR"
+    
+    # Consolidate logs
+    write_to_consolidated_log "$APP_NAME" "$DATE_IDENTIFIER"
+    rm -f "$LOG_FILE" "$LOG_FILE.lock"
 }
 
-#------------------------------------------------------------------------------
-# Main function
-#------------------------------------------------------------------------------
+# Main function to handle multiple dates
 main() {
-    log_message "INFO" "Starting HDFS download process" "\"app\":\"${APP_NAME}\",\"hdfs_path\":\"${HDFS_BASE_PATH}\",\"date_range\":\"${DATE_RANGE}\",\"target_dir\":\"${TARGET_DIR}\""
+    local dates_array=($DATE_LIST)
     
-    # Generate list of dates to process
-    local dates_to_process
-    dates_to_process=$(generate_date_list "$START_DATE" "$END_DATE")
+    log_message "INFO" "Starting HDFS download process" "\"paths\":\"${BASE_PATHS}\",\"dates\":\"${dates_array[*]}\",\"output_dir\":\"${OUTPUT_DIR}\""
     
     local total_success=0
     local total_files=0
-    local processed_dates=0
+    local failed_dates=()
     
-    while IFS= read -r date_to_process; do
-        if [ -n "$date_to_process" ]; then
-            processed_dates=$((processed_dates + 1))
-            if process_date "$date_to_process"; then
-                total_success=$((total_success + 1))
-            fi
+    IFS=',' read -ra PATHS <<< "$BASE_PATHS"
+    
+    for current_date in "${dates_array[@]}"; do
+        if process_date "$current_date" "${PATHS[@]}"; then
+            log_message "INFO" "Date completed successfully" "\"date\":\"${current_date}\""
+        else
+            log_message "ERROR" "Date processing failed" "\"date\":\"${current_date}\""
+            failed_dates+=("$current_date")
         fi
-    done <<< "$dates_to_process"
+    done
     
-    log_message "INFO" "Process completed" "\"processed_dates\":${processed_dates},\"successful_dates\":${total_success}"
+    # Final summary
+    local total_dates=${#dates_array[@]}
+    local successful_dates=$((total_dates - ${#failed_dates[@]}))
     
-    if [ $total_success -ne $processed_dates ]; then
-        log_message "ERROR" "Some dates failed processing" "\"failed_dates\":$((processed_dates - total_success))"
+    log_message "INFO" "Process completed" "\"total_dates\":${total_dates},\"successful_dates\":${successful_dates},\"failed_dates\":\"${failed_dates[*]}\""
+    
+    if [ ${#failed_dates[@]} -gt 0 ]; then
+        log_message "ERROR" "Some dates failed" "\"failed_dates\":\"${failed_dates[*]}\""
         exit 1
     fi
 }
 
-#------------------------------------------------------------------------------
 # Parse input parameters
-#------------------------------------------------------------------------------
-if [ $# -ne 4 ]; then
-    echo "Usage: $0 <app_name> <hdfs_base_path> <date_range> <target_dir>"
-    echo "Example: $0 myapp \"/prd/logs\" \"20250401-20250601\" \"/target/directory\""
+if [ $# -lt 2 ]; then
+    echo "Usage: $0 <app_name> <base_path1,base_path2,...> [date|date_range] [output_dir]"
+    echo ""
+    echo "NOTE: Files will be written directly to output_dir without date subdirectories"
+    echo ""
+    echo "Date formats:"
+    echo "  Single date: YYYYMMDD (e.g., 20240120)"
+    echo "  Date range:  YYYYMMDD-YYYYMMDD (e.g., 20240120-20240125)"
+    echo "  Date range:  YYYYMMDD,YYYYMMDD (e.g., 20240120,20240125)"
+    echo "  No date:     omit parameter or use '00000000'"
+    echo ""
+    echo "Examples:"
+    echo "  $0 myapp \"/path1,/path2\" 20240120"
+    echo "  $0 myapp \"/path1,/path2\" 20240120-20240125"
+    echo "  $0 myapp \"/path1,/path2\" 20240120,20240125 /custom/output"
     exit 1
 fi
 
 APP_NAME="$1"
-HDFS_BASE_PATH="$2"
-DATE_RANGE="$3"
-TARGET_DIR="$4"
+BASE_PATHS="$2"
+DATE_INPUT="${3:-00000000}"  # Default to "00000000" if no date provided
+OUTPUT_DIR="${4:-$DEFAULT_OUTPUT_DIR}"
 
-# Parse and validate date range
-if ! parse_date_range "$DATE_RANGE"; then
+# Parse date range
+if ! DATE_LIST=$(parse_date_range "$DATE_INPUT"); then
     exit 1
 fi
 
-# Validate target directory
-if ! validate_target_dir "$TARGET_DIR"; then
+# Create date identifier for logging
+if [ "$DATE_INPUT" = "00000000" ]; then
+    DATE_IDENTIFIER="nodate"
+elif [ "$DATE_INPUT" != "${DATE_INPUT%-*}" ] || [ "$DATE_INPUT" != "${DATE_INPUT%,*}" ]; then
+    DATE_IDENTIFIER="range_$(echo "$DATE_INPUT" | tr '-,' '_')"
+else
+    DATE_IDENTIFIER="$DATE_INPUT"
+fi
+
+# Validate output directory
+if ! validate_output_dir "$OUTPUT_DIR"; then
     exit 1
 fi
 
-# Prepare logging
-setup_logging "$APP_NAME"
+setup_logging "$APP_NAME" "$DATE_IDENTIFIER"
 
-# Create temporary directory for downloads
+# Create temporary directory
 TEMP_DIR="/tmp/hdfs_download_${PROCESS_ID}"
 mkdir -p "$TEMP_DIR"
-chown -R "${SPLUNK_USER}:${SPLUNK_GROUP}" "$TEMP_DIR"
+chown -R ${SPLUNK_USER}:${SPLUNK_GROUP} "$TEMP_DIR"
 
 trap cleanup EXIT
-
-# Execute main logic
 main
